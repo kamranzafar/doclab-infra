@@ -1,0 +1,168 @@
+# FreeIPA: server on rhel-server (mgmt.doc), clients on jumpserver, rhel-security, security-main.
+# DNS stays in Route 53 (private zones per domain), so IPA does not manage DNS or NTP
+# (instances keep the Amazon Time Sync Service).
+
+- name: FreeIPA server
+  hosts: ipaserver
+  become: true
+  vars:
+    ipaserver_setup_dns: false
+    ipaserver_no_hbac_allow: false
+    ipaclient_no_ntp: true
+    ipaserver_no_ntp: true
+    # Lite mode runs IPA on a t3.small (2 GB) plus swap; the installer wants 1.2 GB *free* RAM
+    ipaserver_mem_check: "{{ ansible_memtotal_mb >= 3500 }}"
+  pre_tasks:
+    - name: Make the server FQDN resolve locally as well
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ ansible_host }} {{ inventory_hostname }} {{ inventory_hostname_short }}"
+  roles:
+    - role: freeipa.ansible_freeipa.ipaserver
+      state: present
+
+- name: FreeIPA clients
+  hosts: ipaclients
+  become: true
+  vars:
+    ipaclient_servers: ["{{ ipa_server_fqdn }}"]
+    ipaclient_hostname: "{{ inventory_hostname }}"
+    ipaclient_mkhomedir: true
+    ipaclient_no_ntp: true
+    ipaadmin_principal: admin
+  roles:
+    - role: freeipa.ansible_freeipa.ipaclient
+      state: present
+
+# ---------------------------------------------------------------------------
+# Users and access policy
+#   labadmin - lab administrator: FreeIPA admin (admins group) + it-admins
+#   itadmin  - IT administrator: it-admins only (SSH + sudo on every IPA host,
+#              but cannot manage FreeIPA itself)
+# it-admins gets an HBAC rule (log in to all IPA hosts) and a sudo rule (any command).
+# Passwords are generated into ~/.doclab-secrets/ipa_user_<name> on the controller.
+# Admin path: VPN -> ssh <user>@jumpserver.mgmt.doc (password) -> ssh <host> (Kerberos, no password)
+# ---------------------------------------------------------------------------
+- name: FreeIPA users, groups, HBAC and sudo rules
+  hosts: ipaserver
+  become: true
+  tasks:
+    - name: Home directories are created on first login (IPA server too)
+      ansible.builtin.shell: |
+        authselect current | grep -q with-mkhomedir && echo unchanged || authselect enable-feature with-mkhomedir
+      register: mkhome
+      changed_when: "'unchanged' not in mkhome.stdout"
+
+    - name: oddjobd creates the home directories
+      ansible.builtin.systemd:
+        name: oddjobd
+        state: started
+        enabled: true
+
+    - name: Group for IT administrators
+      freeipa.ansible_freeipa.ipagroup:
+        ipaadmin_password: "{{ ipaadmin_password }}"
+        name: it-admins
+        description: IT administrators - SSH and sudo on all lab servers
+
+    - name: Users
+      freeipa.ansible_freeipa.ipauser:
+        ipaadmin_password: "{{ ipaadmin_password }}"
+        name: "{{ item.name }}"
+        first: "{{ item.first }}"
+        last: "{{ item.last }}"
+        title: "{{ item.title }}"
+        shell: /bin/bash
+        password: "{{ lookup('ansible.builtin.password', secrets_dir ~ '/ipa_user_' ~ item.name, chars=['ascii_letters', 'digits'], length=20) }}"
+        # Admin-set IPA passwords are expired immediately; keep these usable for the lab.
+        # Users can still change theirs any time with `passwd` or `ipa passwd`.
+        passwordexpiration: "2099-12-31 23:59:59"
+        update_password: on_create
+        sshpubkey: "{{ item.sshpubkey | default(omit) }}"
+      loop: "{{ ipa_lab_users }}"
+      loop_control: { label: "{{ item.name }}" }
+      no_log: true
+
+    - name: Group memberships
+      freeipa.ansible_freeipa.ipagroup:
+        ipaadmin_password: "{{ ipaadmin_password }}"
+        name: "{{ item.1 }}"
+        user: ["{{ item.0.name }}"]
+        action: member
+      loop: "{{ ipa_lab_users | subelements('groups') }}"
+      loop_control: { label: "{{ item.0.name }} -> {{ item.1 }}" }
+
+    - name: HBAC - it-admins may log in to every IPA host with any service
+      freeipa.ansible_freeipa.ipahbacrule:
+        ipaadmin_password: "{{ ipaadmin_password }}"
+        name: it-admins-all-hosts
+        description: IT administrators can log in to all lab servers
+        hostcategory: all
+        servicecategory: all
+        group: [it-admins]
+
+    - name: sudo - it-admins may run any command as any user on every IPA host
+      freeipa.ansible_freeipa.ipasudorule:
+        ipaadmin_password: "{{ ipaadmin_password }}"
+        name: it-admins-all-commands
+        description: IT administrators have full sudo on all lab servers (password required)
+        hostcategory: all
+        cmdcategory: all
+        runasusercategory: all
+        runasgroupcategory: all
+        group: [it-admins]
+
+# SSSD caches users and sudo rules (sudo rules only refresh on a timer, and `sss_cache -E` does
+# not trigger it), so new users/rules would take a while to apply. Where the it-admins rule is
+# not visible yet, flush the cache, restart SSSD and wait until it is.
+- name: Refresh SSSD on every IPA host so new users and rules apply now
+  hosts: ipaserver:ipaclients
+  become: true
+  gather_facts: false
+  vars:
+    check_user: "{{ (ipa_lab_users | selectattr('groups', 'contains', 'it-admins') | first).name }}"
+  tasks:
+    - name: Is the it-admins sudo rule already visible?
+      ansible.builtin.command: sudo -l -U {{ check_user }}
+      register: sudo_before
+      changed_when: false
+
+    - name: Flush the SSSD cache and restart SSSD
+      ansible.builtin.shell: sss_cache -E && systemctl restart sssd
+      when: "'(ALL : ALL) ALL' not in sudo_before.stdout"
+
+    - name: Wait until the it-admins sudo rule is visible
+      ansible.builtin.command: sudo -l -U {{ check_user }}
+      register: sudo_rules
+      until: "'(ALL : ALL) ALL' in sudo_rules.stdout"
+      retries: 12
+      delay: 5
+      changed_when: false
+
+- name: Jumpserver accepts IPA passwords over SSH (entry point from the VPN)
+  hosts: jumpserver.mgmt.doc
+  become: true
+  tasks:
+    # AlmaLinux/RHEL cloud images disable password logins in 50-cloud-init.conf; sshd uses the
+    # first value it reads, so this file must sort before it. ec2-user has no password, so it
+    # stays key-only. Other servers are reached from here with Kerberos (GSSAPI).
+    - name: Allow password authentication
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/40-doclab-ipa.conf
+        mode: "0600"
+        content: |
+          # Managed by Ansible - IPA users log in here with their password, then hop with Kerberos
+          PasswordAuthentication yes
+      notify: Check and restart sshd
+
+  handlers:
+    # Test the whole config (main file + all drop-ins) before restarting
+    - name: Check and restart sshd
+      ansible.builtin.command: sshd -t
+      changed_when: true
+      notify: Restart sshd
+
+    - name: Restart sshd
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted

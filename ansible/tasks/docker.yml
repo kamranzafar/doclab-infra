@@ -1,0 +1,22 @@
+# Docker CE from Docker's RHEL repo (works on RHEL 9 and AlmaLinux 9)
+- name: Remove podman/buildah (conflict with docker-ce)
+  ansible.builtin.dnf:
+    name: [podman, buildah, runc]
+    state: absent
+
+- name: Add Docker CE repository
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/rhel/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    mode: "0644"
+
+- name: Install Docker CE and the compose plugin
+  ansible.builtin.dnf:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
+    state: present
+
+- name: Start Docker
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true

@@ -1,0 +1,197 @@
+# OpenVPN on openvpn (dmz.doc): easy-rsa PKI, UDP 1194, routes the VPC to clients and NATs
+# client traffic behind the OpenVPN host (so security groups that trust the openvpn SG apply).
+# Client profiles (.ovpn) are fetched to the controller: ~/.doclab-secrets/openvpn/<name>.ovpn
+
+- name: OpenVPN server
+  hosts: openvpn
+  become: true
+  vars:
+    easyrsa: /usr/share/easy-rsa/3/easyrsa
+    pki: /etc/openvpn/easy-rsa/pki
+    easyrsa_env:
+      EASYRSA_BATCH: "1"
+      EASYRSA_PKI: "{{ pki }}"
+      EASYRSA_REQ_CN: doclab-vpn-ca
+  tasks:
+    - name: Install OpenVPN, easy-rsa and nftables
+      ansible.builtin.dnf:
+        name: [openvpn, easy-rsa, nftables]
+        state: present
+
+    - name: PKI parent directory
+      ansible.builtin.file:
+        path: /etc/openvpn/easy-rsa
+        state: directory
+        mode: "0700"
+
+    - name: Initialise PKI
+      ansible.builtin.command: "{{ easyrsa }} init-pki"
+      args:
+        creates: "{{ pki }}/private"
+      environment: "{{ easyrsa_env }}"
+
+    - name: Build CA
+      ansible.builtin.command: "{{ easyrsa }} build-ca nopass"
+      args:
+        creates: "{{ pki }}/ca.crt"
+      environment: "{{ easyrsa_env }}"
+
+    - name: Build server certificate
+      ansible.builtin.command: "{{ easyrsa }} build-server-full server nopass"
+      args:
+        creates: "{{ pki }}/issued/server.crt"
+      environment: "{{ easyrsa_env }}"
+
+    - name: Build client certificates
+      ansible.builtin.command: "{{ easyrsa }} build-client-full {{ item }} nopass"
+      args:
+        creates: "{{ pki }}/issued/{{ item }}.crt"
+      environment: "{{ easyrsa_env }}"
+      loop: "{{ openvpn_clients }}"
+
+    - name: Install server certificate and key
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "/etc/openvpn/server/{{ item.dest }}"
+        remote_src: true
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ pki }}/ca.crt", dest: ca.crt, mode: "0644" }
+        - { src: "{{ pki }}/issued/server.crt", dest: server.crt, mode: "0644" }
+        - { src: "{{ pki }}/private/server.key", dest: server.key, mode: "0600" }
+      notify: Restart openvpn
+
+    - name: Generate tls-crypt key
+      ansible.builtin.command: openvpn --genkey secret /etc/openvpn/server/tc.key
+      args:
+        creates: /etc/openvpn/server/tc.key
+
+    - name: Server configuration
+      ansible.builtin.template:
+        src: templates/openvpn-server.conf.j2
+        dest: /etc/openvpn/server/server.conf
+        mode: "0644"
+      notify: Restart openvpn
+
+    - name: Restore SELinux labels
+      ansible.builtin.command: restorecon -R /etc/openvpn
+      changed_when: false
+
+    - name: Enable IP forwarding
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-openvpn.conf
+        content: "net.ipv4.ip_forward = 1\n"
+        mode: "0644"
+      notify: Apply sysctl
+
+    - name: NAT rules for VPN clients
+      ansible.builtin.copy:
+        dest: /etc/nftables/doclab-nat.nft
+        mode: "0600"
+        content: |
+          table ip doclab_nat
+          delete table ip doclab_nat
+          table ip doclab_nat {
+            chain postrouting {
+              type nat hook postrouting priority srcnat; policy accept;
+              ip saddr {{ openvpn_network }}/24 oifname "{{ ansible_default_ipv4.interface }}" masquerade
+            }
+          }
+      notify: Restart nftables
+
+    - name: Load NAT rules at boot
+      ansible.builtin.lineinfile:
+        path: /etc/sysconfig/nftables.conf
+        line: include "/etc/nftables/doclab-nat.nft"
+      notify: Restart nftables
+
+    - name: Enable nftables
+      ansible.builtin.systemd:
+        name: nftables
+        state: started
+        enabled: true
+
+    - name: Start OpenVPN
+      ansible.builtin.systemd:
+        name: openvpn-server@server
+        state: started
+        enabled: true
+
+    # ---- Client profiles ----
+    - name: Get an IMDSv2 token
+      ansible.builtin.uri:
+        url: http://169.254.169.254/latest/api/token
+        method: PUT
+        headers:
+          X-aws-ec2-metadata-token-ttl-seconds: "300"
+        return_content: true
+      register: imds_token
+
+    - name: Look up the public (Elastic) IP
+      ansible.builtin.uri:
+        url: http://169.254.169.254/latest/meta-data/public-ipv4
+        headers:
+          X-aws-ec2-metadata-token: "{{ imds_token.content }}"
+        return_content: true
+      register: public_ip
+
+    - name: Read CA and tls-crypt key
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ pki }}/ca.crt"
+        - /etc/openvpn/server/tc.key
+      register: server_files
+
+    - name: Read client certificates
+      ansible.builtin.slurp:
+        src: "{{ pki }}/issued/{{ item }}.crt"
+      loop: "{{ openvpn_clients }}"
+      register: client_certs
+
+    - name: Read client keys
+      ansible.builtin.slurp:
+        src: "{{ pki }}/private/{{ item }}.key"
+      loop: "{{ openvpn_clients }}"
+      register: client_keys
+
+    - name: Client profile directory
+      ansible.builtin.file:
+        path: /etc/openvpn/clients
+        state: directory
+        mode: "0700"
+
+    - name: Write client profiles
+      ansible.builtin.template:
+        src: templates/openvpn-client.ovpn.j2
+        dest: "/etc/openvpn/clients/{{ item.0 }}.ovpn"
+        mode: "0600"
+      loop: "{{ openvpn_clients | zip(client_certs.results, client_keys.results) | list }}"
+      vars:
+        vpn_remote: "{{ public_ip.content }}"
+        ca_pem: "{{ server_files.results[0].content | b64decode }}"
+        tc_key: "{{ server_files.results[1].content | b64decode }}"
+        cert_pem: "{{ item.1.content | b64decode | regex_search('-----BEGIN CERTIFICATE-----[\\s\\S]+-----END CERTIFICATE-----') }}"
+        key_pem: "{{ item.2.content | b64decode }}"
+
+    - name: Copy client profiles to the controller
+      ansible.builtin.fetch:
+        src: "/etc/openvpn/clients/{{ item }}.ovpn"
+        dest: "{{ secrets_dir }}/openvpn/"
+        flat: true
+      loop: "{{ openvpn_clients }}"
+
+  handlers:
+    - name: Apply sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart nftables
+      ansible.builtin.systemd:
+        name: nftables
+        state: restarted
+
+    - name: Restart openvpn
+      ansible.builtin.systemd:
+        name: openvpn-server@server
+        state: restarted

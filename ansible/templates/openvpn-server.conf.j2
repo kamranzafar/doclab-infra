@@ -1,0 +1,35 @@
+# Managed by Ansible
+port 1194
+proto udp
+dev tun
+
+ca ca.crt
+cert server.crt
+key server.key
+dh none
+ecdh-curve prime256v1
+tls-crypt tc.key
+tls-version-min 1.2
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+auth SHA256
+
+topology subnet
+server {{ openvpn_network }} {{ openvpn_netmask }}
+ifconfig-pool-persist /var/lib/openvpn/ipp.txt
+
+# Only the lab VPC goes through the tunnel; DNS uses the VPC resolver so *.doc names resolve
+push "route {{ vpc_cidr.split('/')[0] }} {{ vpc_netmask }}"
+push "dhcp-option DNS {{ vpc_dns }}"
+push "dhcp-option DOMAIN mgmt.doc"
+push "dhcp-option DOMAIN-SEARCH mgmt.doc"
+push "dhcp-option DOMAIN-SEARCH sec.doc"
+push "dhcp-option DOMAIN-SEARCH dmz.doc"
+
+keepalive 10 120
+user nobody
+group nobody
+persist-key
+persist-tun
+status /var/log/openvpn-status.log
+verb 3
+explicit-exit-notify 1

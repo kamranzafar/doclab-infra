@@ -1,0 +1,26 @@
+# doclab VPN profile for {{ item.0 }} - keep this file private (contains the client key)
+client
+dev tun
+proto udp
+remote {{ vpn_remote }} 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+auth SHA256
+verb 3
+
+<ca>
+{{ ca_pem | trim }}
+</ca>
+<cert>
+{{ cert_pem | trim }}
+</cert>
+<key>
+{{ key_pem | trim }}
+</key>
+<tls-crypt>
+{{ tc_key | trim }}
+</tls-crypt>

@@ -1,0 +1,106 @@
+#!/bin/bash
+# Rendered by Terraform for ${fqdn} (${role}).
+# Base bootstrap only. Application configuration (FreeIPA install/enrolment,
+# Graylog, Snort, OpenVAS, GLPI, OpenVPN PKI) is done by Ansible from rhel-server.
+set -euxo pipefail
+exec > >(tee -a /var/log/bootstrap.log) 2>&1
+
+hostnamectl set-hostname ${fqdn}
+
+# Small instances (e.g. t3.micro in lite mode) get OOM-killed during dnf installs - add swap
+if [ "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -lt 2000000 ] && [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap defaults 0 0' >> /etc/fstab
+fi
+
+# Public DMZ hosts receive their Elastic IP shortly after boot - wait for outbound access
+for i in $(seq 1 60); do
+  curl -sf --max-time 5 -o /dev/null https://aws.amazon.com && break
+  sleep 10
+done
+
+# SSM agent is not preinstalled on RHEL AMIs
+dnf install -y https://s3.${region}.amazonaws.com/amazon-ssm-${region}/latest/linux_amd64/amazon-ssm-agent.rpm
+systemctl enable --now amazon-ssm-agent
+
+dnf install -y policycoreutils-python-utils
+
+# Trust the Ansible controller key (rhel-server)
+install -d -m 700 -o ec2-user -g ec2-user /home/ec2-user/.ssh
+echo '${ansible_public_key}' >> /home/ec2-user/.ssh/authorized_keys
+chown ec2-user:ec2-user /home/ec2-user/.ssh/authorized_keys
+chmod 600 /home/ec2-user/.ssh/authorized_keys
+restorecon -R /home/ec2-user/.ssh
+
+%{ if forward_logs ~}
+# Rsyslog: forward everything to Graylog on security-main (disk-assisted queue survives outages)
+dnf install -y rsyslog
+semanage port -a -t syslogd_port_t -p tcp 1514 || semanage port -m -t syslogd_port_t -p tcp 1514
+cat > /etc/rsyslog.d/90-graylog.conf <<'EOF'
+*.* action(type="omfwd" target="${graylog_ip}" port="1514" protocol="tcp"
+           template="RSYSLOG_SyslogProtocol23Format"
+           queue.type="LinkedList" queue.filename="graylog_fwd"
+           queue.saveOnShutdown="on" action.resumeRetryCount="-1")
+EOF
+systemctl enable rsyslog
+systemctl restart rsyslog
+%{ endif ~}
+
+%{ if contains(["jumpserver", "rhel_security", "security_main"], role) ~}
+# FreeIPA client packages (enrolment done by Ansible: freeipa.ansible_freeipa.ipaclient)
+dnf install -y ipa-client
+%{ endif ~}
+
+%{ if role == "rhel_server" ~}
+# FreeIPA server packages + Ansible controller
+dnf install -y ipa-server ansible-core unzip
+
+curl -sSfL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+unzip -q -o /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update
+
+/usr/local/bin/aws ssm get-parameter --region ${region} --name '${ansible_key_param}' \
+  --with-decryption --query Parameter.Value --output text > /home/ec2-user/.ssh/id_ansible
+chown ec2-user:ec2-user /home/ec2-user/.ssh/id_ansible
+chmod 600 /home/ec2-user/.ssh/id_ansible
+
+install -d /etc/ansible
+cat > /etc/ansible/hosts <<'EOF'
+${inventory}
+EOF
+
+sudo -u ec2-user ansible-galaxy collection install freeipa.ansible_freeipa ansible.posix community.general || true
+%{ endif ~}
+
+%{ if role == "rhel_security" ~}
+# Docker CE for OpenVAS (Greenbone Community Edition) and GLPI containers
+dnf remove -y podman buildah runc || true
+dnf install -y dnf-plugins-core
+dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
+usermod -aG docker ec2-user
+%{ endif ~}
+
+%{ if role == "security_main" ~}
+# Graylog's OpenSearch backend needs a higher mmap count; Graylog + Snort installed by Ansible
+echo 'vm.max_map_count = 262144' > /etc/sysctl.d/99-opensearch.conf
+sysctl --system
+%{ endif ~}
+
+%{ if role == "webserver" ~}
+dnf install -y nginx
+systemctl enable --now nginx
+%{ endif ~}
+
+%{ if role == "openvpn" ~}
+dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+dnf install -y openvpn easy-rsa
+echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-openvpn.conf
+sysctl --system
+%{ endif ~}
+
+echo "Bootstrap complete for ${fqdn}"

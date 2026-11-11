@@ -1,0 +1,31 @@
+# Managed by Ansible
+services:
+  snort:
+    image: {{ snort_image }}
+    restart: unless-stopped
+    network_mode: host
+    user: root
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes:
+      - {{ snort_dir }}/rules:/rules:ro
+      - /var/log/snort:/var/log/snort
+    # The image's entrypoint is "sh -c bash", which would ignore the command
+    entrypoint: ["/home/snorty/snort3/bin/snort"]
+    command:
+      - -c
+      - /home/snorty/snort3/etc/snort/snort.lua
+      - -R
+      - /rules/local.rules
+      - -i
+      - {{ ansible_default_ipv4.interface }}
+      - -A
+      - alert_fast
+      # Snort 3 writes alert_fast to stdout unless file output is switched on
+      - --lua
+      - "alert_fast = { file = true }"
+      - -l
+      - /var/log/snort
+      - -k
+      - none
+      - -s
+      - "65535"

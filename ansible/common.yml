@@ -1,0 +1,46 @@
+- name: Controller - secrets directory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    # Owned by ec2-user: password lookups run as the controller user, not via become
+    - name: Create the secrets directory
+      ansible.builtin.file:
+        path: "{{ secrets_dir }}"
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+        mode: "0700"
+        recurse: true
+
+- name: Common baseline for every host
+  hosts: all
+  become: true
+  tasks:
+    - name: Create swap on small hosts (FreeIPA, OpenVAS and dnf get OOM-killed otherwise)
+      when: ansible_memtotal_mb < swap_below_mb and ansible_swaptotal_mb == 0
+      block:
+        - name: Allocate swap file
+          ansible.builtin.command: "dd if=/dev/zero of=/swapfile bs=1M count={{ swap_size_mb }} status=none"
+          args:
+            creates: /swapfile
+
+        - name: Restrict swap file permissions
+          ansible.builtin.file:
+            path: /swapfile
+            mode: "0600"
+
+        - name: Format and enable swap
+          ansible.builtin.shell: mkswap /swapfile && swapon /swapfile
+          changed_when: true
+
+        - name: Persist swap in fstab
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            line: /swapfile none swap defaults 0 0
+
+    - name: Install common tools
+      ansible.builtin.dnf:
+        name: [vim-enhanced, tar, bind-utils, policycoreutils-python-utils]
+        state: present

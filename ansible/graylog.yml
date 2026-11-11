@@ -1,0 +1,118 @@
+# Graylog on security-main (sec.doc): Graylog + OpenSearch + MongoDB in Docker.
+# Inputs: Syslog TCP/UDP 1514 (rsyslog from every host), GELF UDP 12201 (Docker containers).
+# Web UI: http://security-main.sec.doc:9000 (from jumpserver / VPN), user admin.
+
+- name: Graylog
+  hosts: graylog
+  become: true
+  vars:
+    graylog_dir: /opt/graylog
+    graylog_api: http://127.0.0.1:9000/api
+    graylog_inputs:
+      - title: Syslog TCP
+        type: org.graylog2.inputs.syslog.tcp.SyslogTCPInput
+        configuration:
+          bind_address: 0.0.0.0
+          port: 1514
+          recv_buffer_size: 1048576
+          number_worker_threads: 2
+          tcp_keepalive: false
+          use_null_delimiter: false
+          max_message_size: 2097152
+          allow_override_date: true
+          store_full_message: false
+          expand_structured_data: false
+          force_rdns: false
+          tls_enable: false
+      - title: Syslog UDP
+        type: org.graylog2.inputs.syslog.udp.SyslogUDPInput
+        configuration:
+          bind_address: 0.0.0.0
+          port: 1514
+          recv_buffer_size: 262144
+          number_worker_threads: 2
+          allow_override_date: true
+          store_full_message: false
+          expand_structured_data: false
+          force_rdns: false
+      - title: GELF UDP
+        type: org.graylog2.inputs.gelf.udp.GELFUDPInput
+        configuration:
+          bind_address: 0.0.0.0
+          port: 12201
+          recv_buffer_size: 262144
+          number_worker_threads: 2
+          decompress_size_limit: 8388608
+  tasks:
+    - name: Install Docker
+      ansible.builtin.include_tasks: tasks/docker.yml
+
+    - name: OpenSearch needs a higher mmap count
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-opensearch.conf
+        content: "vm.max_map_count = 262144\n"
+        mode: "0644"
+      register: mmap
+
+    - name: Apply sysctl
+      ansible.builtin.command: sysctl --system
+      when: mmap.changed
+
+    - name: Graylog directory
+      ansible.builtin.file:
+        path: "{{ graylog_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Compose file
+      ansible.builtin.template:
+        src: templates/graylog-compose.yml.j2
+        dest: "{{ graylog_dir }}/compose.yml"
+        mode: "0600"
+      register: compose
+
+    - name: Start Graylog stack
+      ansible.builtin.command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ graylog_dir }}"
+      register: up
+      changed_when: "'Started' in up.stderr or 'Recreated' in up.stderr or 'Created' in up.stderr"
+
+    - name: Wait for the Graylog API
+      ansible.builtin.uri:
+        url: "{{ graylog_api }}/system/lbstatus"
+        return_content: true
+      register: lb
+      until: lb.status == 200 and 'ALIVE' in lb.content
+      retries: 60
+      delay: 10
+
+    - name: List existing inputs
+      ansible.builtin.uri:
+        url: "{{ graylog_api }}/system/inputs"
+        user: admin
+        password: "{{ graylog_admin_password }}"
+        force_basic_auth: true
+        headers:
+          X-Requested-By: ansible
+      register: existing
+
+    - name: Create missing inputs
+      ansible.builtin.uri:
+        url: "{{ graylog_api }}/system/inputs"
+        method: POST
+        user: admin
+        password: "{{ graylog_admin_password }}"
+        force_basic_auth: true
+        headers:
+          X-Requested-By: ansible
+        body_format: json
+        body:
+          title: "{{ item.title }}"
+          type: "{{ item.type }}"
+          global: true
+          configuration: "{{ item.configuration }}"
+        status_code: [200, 201]
+      loop: "{{ graylog_inputs }}"
+      when: item.title not in (existing.json.inputs | map(attribute='title') | list)
+      changed_when: true

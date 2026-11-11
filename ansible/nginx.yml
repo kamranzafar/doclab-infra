@@ -1,0 +1,57 @@
+# NGINX on webserver (dmz.doc): HTTPS with a self-signed certificate, HTTP redirects to HTTPS.
+# Also installs the PostgreSQL client for the PII database (pii-db.dmz.doc).
+
+- name: NGINX web server
+  hosts: nginx
+  become: true
+  tasks:
+    - name: Install NGINX, OpenSSL and the PostgreSQL client
+      ansible.builtin.dnf:
+        name: [nginx, openssl, postgresql]
+        state: present
+
+    - name: Certificate directory
+      ansible.builtin.file:
+        path: /etc/pki/nginx/private
+        state: directory
+        mode: "0700"
+
+    - name: Self-signed certificate (replace with a real one for public use)
+      ansible.builtin.command: >
+        openssl req -x509 -nodes -newkey rsa:2048 -days 825
+        -keyout /etc/pki/nginx/private/server.key -out /etc/pki/nginx/server.crt
+        -subj "/CN={{ inventory_hostname }}"
+        -addext "subjectAltName=DNS:{{ inventory_hostname }}"
+      args:
+        creates: /etc/pki/nginx/server.crt
+      notify: Reload nginx
+
+    - name: Main configuration
+      ansible.builtin.template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+        mode: "0644"
+        validate: nginx -t -c %s
+      notify: Reload nginx
+
+    - name: Landing page
+      ansible.builtin.copy:
+        dest: /usr/share/nginx/html/index.html
+        mode: "0644"
+        content: |
+          <!doctype html>
+          <title>{{ inventory_hostname }}</title>
+          <h1>{{ inventory_hostname }}</h1>
+          <p>doclab DMZ web server, managed by Ansible.</p>
+
+    - name: Start NGINX
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded

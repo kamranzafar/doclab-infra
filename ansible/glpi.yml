@@ -1,0 +1,89 @@
+# GLPI (IT asset management) on rhel-security (sec.doc): GLPI + MariaDB, behind NGINX with a
+# self-signed certificate on 443. Web UI: https://rhel-security.sec.doc (from jumpserver / VPN).
+# Default GLPI logins are glpi/glpi, tech/tech, normal/normal, post-only/postonly - change them.
+# Full build only: point GLPI's LDAP directory at corp.doc (Setup > Authentication > LDAP),
+# using the AD DNS IPs from `terraform output ad_dns_ips`. Lite mode has no AD.
+
+- name: GLPI
+  hosts: glpi
+  become: true
+  vars:
+    glpi_dir: /opt/glpi
+  tasks:
+    - name: Install Docker
+      ansible.builtin.include_tasks: tasks/docker.yml
+
+    - name: GLPI directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ glpi_dir }}"
+        - "{{ glpi_dir }}/certs"
+
+    - name: Self-signed certificate
+      ansible.builtin.command: >
+        openssl req -x509 -nodes -newkey rsa:2048 -days 825
+        -keyout {{ glpi_dir }}/certs/server.key -out {{ glpi_dir }}/certs/server.crt
+        -subj "/CN={{ inventory_hostname }}"
+        -addext "subjectAltName=DNS:{{ inventory_hostname }}"
+      args:
+        creates: "{{ glpi_dir }}/certs/server.crt"
+
+    - name: Certificate readable by the NGINX container
+      ansible.builtin.file:
+        path: "{{ glpi_dir }}/certs/{{ item }}"
+        mode: "0644"
+      loop: [server.crt, server.key]
+
+    - name: NGINX proxy configuration
+      ansible.builtin.copy:
+        dest: "{{ glpi_dir }}/nginx.conf"
+        mode: "0644"
+        content: |
+          server {
+              listen 443 ssl;
+              http2 on;
+              server_name _;
+              ssl_certificate     /etc/nginx/certs/server.crt;
+              ssl_certificate_key /etc/nginx/certs/server.key;
+              ssl_protocols       TLSv1.2 TLSv1.3;
+              client_max_body_size 100m;
+              location / {
+                  proxy_pass http://glpi:80;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+          }
+      register: nginx_conf
+
+    - name: Compose file
+      ansible.builtin.template:
+        src: templates/glpi-compose.yml.j2
+        dest: "{{ glpi_dir }}/compose.yml"
+        mode: "0600"
+
+    - name: Start GLPI
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ glpi_dir }}"
+      register: up
+      changed_when: "'Started' in up.stderr or 'Created' in up.stderr"
+
+    - name: Reload the proxy if its config changed
+      ansible.builtin.command: docker compose restart proxy
+      args:
+        chdir: "{{ glpi_dir }}"
+      when: nginx_conf.changed and 'Created' not in up.stderr
+
+    - name: Wait for GLPI to answer through the proxy
+      ansible.builtin.uri:
+        url: https://127.0.0.1/
+        validate_certs: false
+        status_code: [200, 302]
+      register: glpi_up
+      until: glpi_up.status in [200, 302]
+      retries: 40
+      delay: 15

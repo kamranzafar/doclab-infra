@@ -1,0 +1,94 @@
+# Snort 3 on security-main (sec.doc), using Cisco Talos' snort3 container with the community ruleset.
+# Alerts go to /var/log/snort/alert_fast.txt, which rsyslog ships to Graylog (Syslog TCP 1514, tag "snort").
+# In lite mode there is no Traffic Mirroring, so Snort only sees security-main's own traffic;
+# with enable_traffic_mirroring = true it also sees the webserver's traffic (VXLAN, UDP 4789).
+
+- name: Snort IDS
+  hosts: snort
+  become: true
+  vars:
+    snort_dir: /opt/snort
+    snort_rules_url: https://www.snort.org/downloads/community/snort3-community-rules.tar.gz
+  tasks:
+    - name: Install Docker
+      ansible.builtin.include_tasks: tasks/docker.yml
+
+    - name: Snort directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ snort_dir }}/rules"
+        - /var/log/snort
+
+    - name: Download community rules
+      ansible.builtin.get_url:
+        url: "{{ snort_rules_url }}"
+        dest: "{{ snort_dir }}/snort3-community-rules.tar.gz"
+        mode: "0644"
+      register: rules
+
+    - name: Unpack community rules
+      ansible.builtin.unarchive:
+        src: "{{ snort_dir }}/snort3-community-rules.tar.gz"
+        dest: "{{ snort_dir }}/rules"
+        remote_src: true
+      when: rules.changed
+      notify: Restart snort
+
+    - name: Local rules (community ruleset + a harmless pipeline test rule)
+      ansible.builtin.copy:
+        dest: "{{ snort_dir }}/rules/local.rules"
+        mode: "0644"
+        content: |
+          include /rules/snort3-community-rules/snort3-community.rules
+          # Smoke test: any TCP payload containing this marker raises an alert (verify.yml sends it)
+          alert tcp any any -> any any (msg:"DOCLAB snort pipeline test"; content:"doclab-snort-test"; sid:1000001; rev:1;)
+      notify: Restart snort
+
+    - name: Compose file
+      ansible.builtin.template:
+        src: templates/snort-compose.yml.j2
+        dest: "{{ snort_dir }}/compose.yml"
+        mode: "0644"
+      notify: Restart snort
+
+    - name: Start Snort
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ snort_dir }}"
+      register: up
+      changed_when: "'Started' in up.stderr or 'Created' in up.stderr"
+
+    - name: Allow rsyslog to send to TCP 1514 (SELinux)
+      ansible.builtin.shell: >
+        semanage port -l | grep -qE '^syslogd_port_t.*\btcp\b.*\b1514\b' ||
+        semanage port -a -t syslogd_port_t -p tcp 1514
+      register: sel
+      changed_when: false
+
+    - name: Ship Snort alerts to Graylog
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/60-snort.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible
+          module(load="imfile")
+          input(type="imfile" File="/var/log/snort/alert_fast.txt" Tag="snort:" Facility="local5" Severity="alert")
+          local5.* action(type="omfwd" target="127.0.0.1" port="1514" protocol="tcp"
+                          template="RSYSLOG_SyslogProtocol23Format"
+                          queue.type="LinkedList" queue.filename="snort_fwd" action.resumeRetryCount="-1")
+          & stop
+      notify: Restart rsyslog
+
+  handlers:
+    - name: Restart snort
+      ansible.builtin.command: docker compose up -d --force-recreate
+      args:
+        chdir: "{{ snort_dir }}"
+
+    - name: Restart rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted

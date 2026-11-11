@@ -1,0 +1,95 @@
+# OpenVAS (Greenbone Community Edition containers) on rhel-security (sec.doc).
+# Web UI (GSA): https://rhel-security.sec.doc:9392 (from jumpserver / VPN), user admin.
+# Container logs go to Graylog via the Docker GELF driver (UDP 12201).
+# First start downloads several GB of images and vulnerability feeds; feeds keep syncing
+# in the background for a while (hours on a small instance) before scans give full results.
+
+- name: OpenVAS / Greenbone Community Edition
+  hosts: openvas
+  become: true
+  vars:
+    gce_dir: /opt/greenbone
+    gce_project: greenbone-community-edition
+  tasks:
+    - name: Install Docker
+      ansible.builtin.include_tasks: tasks/docker.yml
+
+    - name: Send container logs to Graylog (GELF) while keeping 'docker logs' working
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "gelf",
+            "log-opts": {
+              "gelf-address": "udp://{{ graylog_host }}:12201",
+              "tag": "{{ '{{' }}.Name{{ '}}' }}"
+            }
+          }
+      register: daemon_json
+
+    - name: Restart Docker for the logging change
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      when: daemon_json.changed
+
+    - name: Greenbone directory
+      ansible.builtin.file:
+        path: "{{ gce_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download the official compose file
+      ansible.builtin.get_url:
+        url: "{{ greenbone_compose_url }}"
+        dest: "{{ gce_dir }}/docker-compose.yml"
+        mode: "0644"
+
+    # Greenbone's nginx serves GSA with TLS on container port 443 (its 9392 only redirects to
+    # :443). Host 443 belongs to GLPI, so publish the TLS listener on host 9392 instead:
+    # GSA is https://rhel-security.sec.doc:9392 (security group limits it to jumpserver / VPN).
+    - name: Drop Greenbone's local 443 mapping
+      ansible.builtin.lineinfile:
+        path: "{{ gce_dir }}/docker-compose.yml"
+        regexp: '^\s*- 127\.0\.0\.1:443:443\s*$'
+        state: absent
+
+    - name: Publish GSA's TLS listener on host port 9392
+      ansible.builtin.replace:
+        path: "{{ gce_dir }}/docker-compose.yml"
+        regexp: '^(\s*- )(127\.0\.0\.1:)?9392:9392\s*$'
+        replace: '\g<1>9392:443'
+
+    - name: Pull images (several GB, first run takes a while)
+      ansible.builtin.command: docker compose -p {{ gce_project }} pull -q
+      args:
+        chdir: "{{ gce_dir }}"
+      changed_when: false
+      async: 3600
+      poll: 15
+
+    # On first start the feed-data containers take longer than compose's health-wait,
+    # so dependants (ospd-openvas, openvasd, nginx) need another 'up' once they're healthy
+    - name: Start Greenbone
+      ansible.builtin.command: docker compose -p {{ gce_project }} up -d
+      args:
+        chdir: "{{ gce_dir }}"
+      register: up
+      until: up.rc == 0
+      retries: 10
+      delay: 30
+      changed_when: "'Started' in up.stderr or 'Created' in up.stderr"
+
+    - name: Set the admin password (waits for gvmd to come up)
+      ansible.builtin.command: >
+        docker compose -p {{ gce_project }} exec -T -u gvmd gvmd
+        gvmd --user=admin --new-password={{ openvas_admin_password }}
+      args:
+        chdir: "{{ gce_dir }}"
+      register: pw
+      until: pw.rc == 0
+      retries: 60
+      delay: 20
+      changed_when: false
+      no_log: true

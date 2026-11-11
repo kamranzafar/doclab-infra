@@ -1,0 +1,44 @@
+# Managed by Ansible
+services:
+  db:
+    image: {{ mariadb_image }}
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: "{{ glpi_db_root_password }}"
+      MARIADB_DATABASE: glpi
+      MARIADB_USER: glpi
+      MARIADB_PASSWORD: "{{ glpi_db_password }}"
+    volumes:
+      - glpi_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      retries: 30
+
+  glpi:
+    image: {{ glpi_image }}
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      GLPI_DB_HOST: db
+      GLPI_DB_PORT: "3306"
+      GLPI_DB_NAME: glpi
+      GLPI_DB_USER: glpi
+      GLPI_DB_PASSWORD: "{{ glpi_db_password }}"
+    volumes:
+      - glpi_data:/var/glpi
+
+  proxy:
+    image: {{ nginx_image }}
+    restart: unless-stopped
+    depends_on: [glpi]
+    ports:
+      - "443:443"
+    volumes:
+      - {{ glpi_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - {{ glpi_dir }}/certs:/etc/nginx/certs:ro
+
+volumes:
+  glpi_db:
+  glpi_data:

@@ -1,0 +1,10 @@
+# Configure the whole lab. Run from rhel-server (scripts/ansible.sh does this over SSM).
+# Graylog first so the other services' logs have somewhere to land.
+- import_playbook: common.yml
+- import_playbook: graylog.yml
+- import_playbook: freeipa.yml
+- import_playbook: nginx.yml
+- import_playbook: openvpn.yml
+- import_playbook: snort.yml
+- import_playbook: glpi.yml
+- import_playbook: openvas.yml

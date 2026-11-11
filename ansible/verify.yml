@@ -1,0 +1,173 @@
+# Read-only health check of the whole lab. Prints a summary per service; changes nothing.
+#   AWS_PROFILE=doclab scripts/ansible.sh verify.yml
+
+- name: Send the Snort test marker at security-main (matches sid 1000001 in local.rules)
+  hosts: jumpserver.mgmt.doc
+  gather_facts: false
+  tasks:
+    - name: Request containing the marker
+      ansible.builtin.uri:
+        url: "http://security-main.sec.doc:9000/?probe=doclab-snort-test"
+        status_code: [200, 301, 302, 400, 401, 404]
+        timeout: 15
+      ignore_errors: true
+
+    - name: Give Snort, rsyslog and Graylog a moment
+      ansible.builtin.pause:
+        seconds: 15
+
+- name: Graylog is receiving logs
+  hosts: graylog
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Message counts for the last hour (all / per source / Snort)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9000/api/search/universal/relative?query={{ item.q | urlencode }}&range=3600&limit=0"
+        user: admin
+        password: "{{ graylog_admin_password }}"
+        force_basic_auth: true
+        # Without Accept: application/json Graylog routes to the CSV export endpoint
+        headers: { X-Requested-By: verify, Accept: application/json }
+      loop:
+        - { name: all, q: "*" }
+        - { name: jumpserver, q: "source:jumpserver*" }
+        - { name: webserver, q: "source:webserver*" }
+        - { name: rhel-security, q: "source:rhel\\-security*" }
+        - { name: snort, q: "application_name:snort" }
+      loop_control: { label: "{{ item.name }}" }
+      register: counts
+
+    - name: Snort container and alert file
+      ansible.builtin.shell: |
+        docker inspect -f '{{ "{{" }}.State.Status{{ "}}" }} (restarts: {{ "{{" }}.RestartCount{{ "}}" }})' snort-snort-1
+        wc -l < /var/log/snort/alert_fast.txt 2>/dev/null || echo 0
+      register: snort
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Graylog messages, last hour: {{ counts.results | map(attribute='item.name') | zip(counts.results | map(attribute='json.total_results')) | map('join', '=') | join(', ') }}"
+          - "Snort: {{ snort.stdout_lines[0] }}, alert lines so far: {{ snort.stdout_lines[1] }}"
+
+- name: FreeIPA server knows the enrolled hosts
+  hosts: ipaserver
+  gather_facts: false
+  become: true
+  tasks:
+    - name: List IPA hosts
+      ansible.builtin.shell: |
+        echo '{{ ipaadmin_password }}' | kinit admin >/dev/null
+        ipa host-find --pkey-only | awk '/Host name:/ {print $3}'
+        kdestroy
+      register: ipa_hosts
+      changed_when: false
+      no_log: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "IPA hosts: {{ ipa_hosts.stdout_lines | join(', ') }}"
+
+- name: Admin path works from jumpserver (DNS, security groups, UIs, IPA identities)
+  hosts: jumpserver.mgmt.doc
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Web UIs
+      ansible.builtin.uri:
+        url: "{{ item.url }}"
+        validate_certs: false
+        follow_redirects: none
+        status_code: [200, 301, 302, 303]
+        timeout: 15
+      loop:
+        - { name: Graylog, url: "http://security-main.sec.doc:9000/" }
+        - { name: GLPI, url: "https://rhel-security.sec.doc/" }
+        - { name: OpenVAS GSA, url: "https://rhel-security.sec.doc:9392/" }
+        - { name: NGINX (DMZ), url: "https://webserver.dmz.doc/" }
+      loop_control: { label: "{{ item.name }}" }
+      register: uis
+      ignore_errors: true
+
+    - name: IPA admin user resolves through SSSD
+      ansible.builtin.command: id admin
+      register: ipa_id
+      changed_when: false
+      ignore_errors: true
+
+    - name: PII database port reachable
+      ansible.builtin.wait_for:
+        host: pii-db.dmz.doc
+        port: 5432
+        timeout: 10
+      register: db
+      ignore_errors: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "{% for r in uis.results %}{{ r.item.name }}={{ r.status | default('FAIL') }} {% endfor %}"
+          - "IPA identity: {{ ipa_id.stdout | default('FAIL') }}"
+          - "PII DB 5432: {{ 'open' if db is succeeded else 'FAIL' }}"
+
+- name: VPN server and client profiles
+  hosts: openvpn
+  gather_facts: false
+  become: true
+  tasks:
+    - name: OpenVPN service state
+      ansible.builtin.command: systemctl is-active openvpn-server@server
+      register: vpn
+      changed_when: false
+      ignore_errors: true
+
+    - name: Client profiles on the controller
+      ansible.builtin.find:
+        paths: "{{ secrets_dir }}/openvpn"
+        patterns: "*.ovpn"
+      delegate_to: localhost
+      become: false
+      register: profiles
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "OpenVPN: {{ vpn.stdout }}; profiles: {{ profiles.files | map(attribute='path') | map('basename') | join(', ') }}"
+
+- name: IPA users can log in, sudo, and hop with Kerberos (jumpserver -> security-main)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    ansible_become: false
+  tasks:
+    - name: Login test per user
+      ansible.builtin.shell: |
+        set -o pipefail
+        askpass=$(mktemp); chmod 700 "$askpass"
+        printf '#!/bin/sh\ncat %s\n' "$pwfile" > "$askpass"
+        # stdin: line 1 makes the remote bash read line 2 (the password), the rest is the script
+        { echo 'read -r PW'; cat "$pwfile"; echo; cat <<'SCRIPT'
+        echo "login=$(id -un)@$(hostname -s) groups=$(id -Gn | tr ' ' ,)"
+        echo "$PW" | sudo -S -p '' true 2>/dev/null && echo "sudo@jumpserver=yes" || echo "sudo@jumpserver=no"
+        klist -s && echo "kerberos=yes" || echo "kerberos=no"
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o GSSAPIAuthentication=yes \
+          security-main.sec.doc "echo hop=\$(id -un)@\$(hostname -s); echo '$PW' | sudo -S -p '' true 2>/dev/null && echo sudo@security-main=yes || echo sudo@security-main=no"
+        SCRIPT
+        } | SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=none setsid ssh \
+              -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+              -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+              "{{ item.name }}@jumpserver.mgmt.doc" 'bash -s'
+        rc=$?; rm -f "$askpass"; exit $rc
+      environment:
+        pwfile: "{{ secrets_dir }}/ipa_user_{{ item.name }}"
+      loop: "{{ ipa_lab_users }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: logins
+      changed_when: false
+      ignore_errors: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{% for r in logins.results %}{{ r.item.name }}: {{ r.stdout_lines | join(' ') if r.rc == 0 else 'FAIL ' ~ (r.stderr | default('')) }} | {% endfor %}"

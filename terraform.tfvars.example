@@ -1,0 +1,27 @@
+region  = "ap-southeast-2"
+project = "doclab"
+azs     = ["ap-southeast-2a", "ap-southeast-2b"]
+
+# Free plan / low-budget build: no Managed AD, WorkSpaces or Network Firewall;
+# AlmaLinux 9 on free-tier-eligible instance types. The instance_types below are
+# ignored-by-default examples for the full build - remove them when using lite mode.
+lite_mode = false
+
+# Lock down perimeter access where possible
+vpn_allowed_cidrs = ["203.0.113.0/24"]
+web_allowed_cidrs = ["0.0.0.0/0"]
+
+instance_types = {
+  security_main = "m6i.xlarge" # needed if enable_traffic_mirroring = true
+  webserver     = "m6i.large"  # mirroring source must also be a supported type
+}
+
+enable_network_firewall  = true
+enable_traffic_mirroring = false
+enable_vuln_scanning     = true
+
+# Find bundles: aws workspaces describe-workspace-bundles --owner AMAZON --region ap-southeast-2
+# workspace_bundle_id = "wsb-xxxxxxxxx"
+# workspace_users     = ["Admin"]
+
+db_deletion_protection = true
